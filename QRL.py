@@ -218,7 +218,7 @@ class QRLAgent:
             bits       = format(int(idx), f'0{self.T}b')
             theta_cand = np.array([int(b) for b in bits], dtype=int)
 
-            if theta_cand.sum() != n_schedule:
+            if theta_cand.sum() == 0:
                 continue
 
             sinr  = mimo_sys.compute_sinr(N, F, theta_cand)
@@ -285,13 +285,15 @@ class QRLAgent:
 
         # ── Stochastic selection via normalised marginal probabilities ─────
         # This is the quantum "measurement" step — sampling, not argmax.
-        marginals_clipped = np.clip(marginals, 1e-9, None)
-        marginals_norm    = marginals_clipped / marginals_clipped.sum()
-
-        selected = np.random.choice(
-            self.T, size=n_schedule, replace=False, p=marginals_norm)
-        theta = np.zeros(self.T, dtype=int)
-        theta[selected] = 1
+        marginals_clipped = np.clip(marginals, 1e-9, 1.0 - 1e-9)
+        
+        # Sampling Bernoulli độc lập (Agent tự quyết định chọn bao nhiêu user)
+        theta = np.random.binomial(1, marginals_clipped)
+        
+        # Fallback: Nếu Agent lỡ tắt hết users, bật user có xác suất cao nhất
+        if theta.sum() == 0:
+            theta[np.argmax(marginals_clipped)] = 1
+            
         return theta
 
     def update(self, N: np.ndarray, advantage: float, theta: np.ndarray):
