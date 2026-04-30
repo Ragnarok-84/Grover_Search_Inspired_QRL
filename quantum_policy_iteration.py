@@ -42,7 +42,7 @@ T_QUBITS = 7                           # drastically reduced from paper's 11
 ESTIMATION_WIRES = list(range(2, 2 + T_QUBITS))   # wires 2-8
 
 # Policy space  P_N  with N = 8 policies
-N_POLICIES = 64                         # must be a power of 2 for clean encoding
+N_POLICIES = 1024                         # must be a power of 2 for clean encoding
 N_POLICY_QUBITS = int(math.log2(N_POLICIES))       # = 3
 
 # Bandit dynamics (deterministic for simplicity)
@@ -54,7 +54,7 @@ DELTA = 0.05           # failure probability for QPE (kept modest for speed)
 
 # QPI / Grover search parameters
 LAMBDA_SCALE = 8/7     # exponential growth rate for Grover rotations
-PATIENCE     = 15       # stop after C iterations without improvement
+PATIENCE     = 30       # stop after C iterations without improvement
 
 # ---------------------------------------------------------------------------
 # 1.  Policy space definition
@@ -592,7 +592,7 @@ def main():
     print("\n--- QPE vs MC benchmark ---")
     sample_counts, qpe_errors, mc_errors = benchmark_qpe_vs_mc(
         p_left=0.5,
-        sample_counts=[100, 250, 500, 1000],
+        sample_counts=[100, 250, 500, 1000, 2000],
         n_reps=10,
     )
     plot_qpe_benchmark(sample_counts, qpe_errors, mc_errors,
