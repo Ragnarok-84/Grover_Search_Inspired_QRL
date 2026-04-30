@@ -33,8 +33,8 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 
-from QRL_fixed  import QRLAgent
-from mMIMO_sys_fixed import MassiveMIMOSystem
+from QRL  import QRLAgent
+from mMIMO_sys import MassiveMIMOSystem
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Hyper-parameters  (match paper Section IV)
