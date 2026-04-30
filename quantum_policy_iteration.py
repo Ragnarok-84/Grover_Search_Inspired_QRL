@@ -38,11 +38,11 @@ W_REWARD = 1
 TARGET_WIRES = [W_ACTION, W_REWARD]   # 2 wires for the MDP step operator
 
 # Phase-estimation ("evaluation") qubits
-T_QUBITS = 4                           # drastically reduced from paper's 11
-ESTIMATION_WIRES = list(range(2, 2 + T_QUBITS))   # wires 2-5
+T_QUBITS = 7                           # drastically reduced from paper's 11
+ESTIMATION_WIRES = list(range(2, 2 + T_QUBITS))   # wires 2-8
 
 # Policy space  P_N  with N = 8 policies
-N_POLICIES = 8                         # must be a power of 2 for clean encoding
+N_POLICIES = 64                         # must be a power of 2 for clean encoding
 N_POLICY_QUBITS = int(math.log2(N_POLICIES))       # = 3
 
 # Bandit dynamics (deterministic for simplicity)
@@ -53,8 +53,8 @@ P_WIN_RIGHT  = 1.0     # p(1|→)
 DELTA = 0.05           # failure probability for QPE (kept modest for speed)
 
 # QPI / Grover search parameters
-LAMBDA_SCALE = 1.2     # exponential growth rate for Grover rotations
-PATIENCE     = 5       # stop after C iterations without improvement
+LAMBDA_SCALE = 8/7     # exponential growth rate for Grover rotations
+PATIENCE     = 15       # stop after C iterations without improvement
 
 # ---------------------------------------------------------------------------
 # 1.  Policy space definition
@@ -592,11 +592,11 @@ def main():
     print("\n--- QPE vs MC benchmark ---")
     sample_counts, qpe_errors, mc_errors = benchmark_qpe_vs_mc(
         p_left=0.5,
-        sample_counts=[100, 250, 500, 1000, 2000],
-        n_reps=20,
+        sample_counts=[100, 250, 500, 1000],
+        n_reps=10,
     )
     plot_qpe_benchmark(sample_counts, qpe_errors, mc_errors,
-                       save_path="/mnt/user-data/outputs/qpe_benchmark.png")
+                       save_path="qpe_benchmark.png")
 
     # --- Full Quantum Policy Iteration ---
     print("\n--- Running Quantum Policy Iteration ---")
@@ -610,7 +610,7 @@ def main():
     # --- Plot ---
     plot_policy_iteration(
         log,
-        save_path="/mnt/user-data/outputs/qpi_result.png",
+        save_path="qpi_result.png",  
     )
 
     print(f"\nFinal result:")
