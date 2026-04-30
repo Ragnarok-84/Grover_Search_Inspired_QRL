@@ -135,13 +135,9 @@ class MassiveMIMOSystem:
 
     def compute_sinr(self, N: np.ndarray, F: np.ndarray,
                      theta: np.ndarray) -> np.ndarray:
-        """
-        Compute per-user SINR for scheduled users (eq. 6).
-        Equal power allocation P = 1 / |{t: theta_t=1}|.
-        """
         sinr  = np.zeros(self.T)
-        n_act = max(int(theta.sum()), 1)
-        P     = 1.0 / n_act
+        
+        P = 1.0 / self.T 
 
         for t in range(self.T):
             if theta[t] == 0:
@@ -189,3 +185,6 @@ class MassiveMIMOSystem:
         sinr  = self.compute_sinr(N, F, theta)
         rates = self.instantaneous_rate(sinr)
         return N, F, sinr, rates
+    
+    def compute_sum_rate(self, rates, theta):
+        return np.sum(rates * theta)
