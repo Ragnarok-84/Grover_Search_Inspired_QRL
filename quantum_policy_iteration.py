@@ -353,7 +353,8 @@ def run_quantum_policy_iteration(
 
     # --- Initialization ---
     # Start with the worst policy: π^1(←) = 1.0 (always Left, value = 0)
-    current_idx = 0
+    # Đổi từ current_idx = 0 thành N - 1 để bắt đầu từ chính sách tệ nhất
+    current_idx = N-1
     current_value = run_QPE(policies[current_idx])
 
     if verbose:
