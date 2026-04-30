@@ -7,37 +7,41 @@ class QRLAgent:
     """
     Grover-inspired QRL agent for mMIMO user scheduling.
 
-    Parameters
-    ----------
-    A         : int    number of BS antennas (used for channel→angle mapping)
-    T         : int    number of users / qubits
-    n_layers  : int     VQC depth (RY+RZ+CNOT blocks)
-    lr        : float   Adam learning rate
-    G         : int    Grover iterations per select() call (Algorithm 1, K)
-    tau       : float   oracle reward threshold τ (Algorithm 1, line 7)
+    FIXES vs original:
+      FIX 1: Correct circuit order — H^⊗N first (uniform superposition),
+              then Oracle, then Diffusion. VQC is used ONLY for state-prep
+              in a separate circuit, not mixed into the Grover loop.
+      FIX 2: Oracle marks states by REWARD > tau, not by probability > tau.
+              _identify_marked_states() now takes reward as input.
+      FIX 3: select() and update() both operate on the VQC circuit (policy).
+              Grover amplification is applied on top of VQC output in select().
+      FIX 4: Default tau set to a meaningful positive value; G=1 kept.
+
+    Architecture (per paper Fig. 1, Algorithm 1):
+      - VQC circuit: AngleEmbed(CSI) + [RY+RZ+CNOT-ring]×n_layers → policy probs
+      - Grover circuit: H^⊗N → [Oracle(M) → Diffusion]×G → amplified probs
+        where M is determined by evaluating reward on candidate schedules.
     """
 
-    def __init__(self, A: int, T: int, n_layers: int = 2,
-                 lr: float = 0.02, G: int = 1, tau: float = 0.0):
+    def __init__(self, A: int, T: int, n_layers: int = 3,
+                 lr: float = 0.02, G: int = 1, tau: float = 0.5):
         self.A        = A
         self.T        = T
         self.n_layers = n_layers
         self.lr       = lr
         self.G        = G
-        self.tau      = tau          # oracle threshold  (eq. Algorithm 1, line 7)
+        self.tau      = tau
         self.N_states = 2 ** T
 
-        # Quantum device — T wires, one per user (Fig. 2)
         self.dev = qml.device("default.qubit", wires=T)
 
-        # Trainable VQC weights: shape (n_layers, T, 2)  [RY, RZ per qubit/layer]
+        # Trainable VQC weights: (n_layers, T, 2)  [RY, RZ per qubit/layer]
         self.weights = pnp.array(
             np.random.uniform(0, np.pi / 2, (n_layers, T, 2)),
             requires_grad=True,
         )
 
         # Precompute bit-mask for fast marginal calculation
-        # _bit_mask[s, t] = 1 if qubit t is |1⟩ in state index s
         indices        = np.arange(self.N_states, dtype=np.int32)
         self._bit_mask = ((indices[:, None] >> np.arange(T - 1, -1, -1)) & 1
                           ).astype(np.float32)          # (N_states, T)
@@ -53,147 +57,100 @@ class QRLAgent:
         # Cache: marked_tuple → compiled Grover QNode
         self._grover_cache: dict = {}
 
-        # Build the base circuit used for inference & training
-        self._build_base_circuit()
+        self._build_vqc_circuit()
+        self._build_hadamard_only_circuit()
 
     # ══════════════════════════════════════════════════════════════════════
     # CIRCUIT BUILDING BLOCKS
     # ══════════════════════════════════════════════════════════════════════
 
-    # ──────────────────────────────────────────────────────────────────────
-    # A.  VQC ANSATZ  —  channel-conditioned state preparation
-    #     AngleEmbedding encodes normalised CSI magnitudes as RY angles,
-    #     followed by trainable RY+RZ rotations and circular CNOT entanglers.
-    #     This is applied BEFORE the Hadamard layer so that the uniform
-    #     superposition is seeded with channel information.
-    # ──────────────────────────────────────────────────────────────────────
     def _vqc_ansatz(self, inputs, weights):
         """
-        VQC: AngleEmbedding(inputs) + [RY, RZ, CNOT-ring] × n_layers.
-        Encodes CSI into qubit rotations before the Hadamard superposition.
+        VQC: AngleEmbedding + [RY, RZ, CNOT-ring] × n_layers.
+        Encodes CSI into trainable qubit rotations.
+        This is the POLICY network — trained via REINFORCE.
         """
-        # Channel-state embedding (eq. 5 / Algorithm 1: state S)
         qml.AngleEmbedding(inputs, wires=range(self.T), rotation='Y')
         for l in range(self.n_layers):
             for i in range(self.T):
                 qml.RY(weights[l, i, 0], wires=i)
                 qml.RZ(weights[l, i, 1], wires=i)
-            # Circular CNOT entanglement ring (Fig. 2)
             for i in range(self.T - 1):
                 qml.CNOT(wires=[i, i + 1])
             qml.CNOT(wires=[self.T - 1, 0])
 
-    # ──────────────────────────────────────────────────────────────────────
-    # B.  HADAMARD LAYER  —  uniform superposition  (eq. 11–12, Fig. 2)
-    #     |ψ₁⟩ = H^⊗N |ψ₀⟩ = (1/√2^N) Σ_{i=0}^{2^N−1} |θ⟩
-    #     This is Layer 1 of the paper's architecture (Fig. 1).
-    # ──────────────────────────────────────────────────────────────────────
     def _hadamard_layer(self):
-        """Apply H to every qubit → uniform superposition (eq. 12)."""
+        """H^⊗N — creates uniform superposition (eq. 11-12)."""
         for i in range(self.T):
             qml.Hadamard(wires=i)
 
-    # ──────────────────────────────────────────────────────────────────────
-    # C.  ORACLE  O_M  (eq. 13, Fig. 2 — Oracle Layer)
-    #     O_M|θ⟩ = -|θ⟩  for θ ∈ M  (marked high-reward states)
-    #            =  |θ⟩  for θ ∉ M
-    #
-    #     Implementation: for each marked index, sandwich a multi-controlled-Z
-    #     with PauliX on the '0' qubits of that basis state so the MCZ fires
-    #     only on |11…1⟩ → phase flip of the desired state.
-    #     Sequential single-target MCZs commute on distinct basis states,
-    #     so the order is irrelevant (correct multi-target oracle).
-    # ──────────────────────────────────────────────────────────────────────
     def _oracle(self, marked_tuple):
         """
-        Phase-flip every state index in marked_tuple (eq. 13).
+        FIX 1 + 2: Oracle O_M (eq. 13).
+        Phase-flip states in marked_tuple.
+        marked_tuple contains state INDICES with high REWARD (not high prob).
 
-        Parameters
-        ----------
-        marked_tuple : tuple of int  —  indices of high-reward states in M
+        The Grover circuit starts from |0⟩^⊗N, so oracle acts on the
+        uniform superposition produced by H^⊗N.
         """
         for idx in marked_tuple:
             bitstring = format(idx, f'0{self.T}b')
-            # X-gate on '0' qubits so target state appears as |11…1⟩
             x_wires = [i for i, b in enumerate(bitstring) if b == '0']
             for w in x_wires:
                 qml.PauliX(wires=w)
-            # Multi-controlled-Z: phase flip only |11…1⟩
             qml.ctrl(qml.PauliZ,
                      control=list(range(self.T - 1)))(wires=self.T - 1)
-            # Restore X-gate flips
             for w in x_wires:
                 qml.PauliX(wires=w)
 
-    # ──────────────────────────────────────────────────────────────────────
-    # D.  DIFFUSION OPERATOR  Diff = 2|U⟩⟨U| - I  (eq. 14, Fig. 2)
-    #     |U⟩ = H^⊗N|0⟩  (uniform state from eq. 12)
-    #
-    #     Standard Grover decomposition:
-    #       Diff = H^⊗N · S₀ · H^⊗N
-    #     where S₀ = 2|0⟩⟨0| - I  (phase-flip of |00…0⟩).
-    #
-    #     CORRECTION vs. previous code:
-    #       Old: A · S₀ · A†  with  A = VQC(inputs, weights)
-    #            → reflection centre changes every training step; breaks
-    #              Grover's inversion-about-the-mean guarantee.
-    #       New: H^⊗N · S₀ · H^⊗N
-    #            → reflection centre is always the fixed uniform state |U⟩
-    #              exactly as stated in eq. 14 and Fig. 1 of the paper.
-    # ──────────────────────────────────────────────────────────────────────
     def _diffusion(self):
         """
-        Grover diffusion operator D = H^⊗N · S₀ · H^⊗N  (eq. 14).
-        Inversion about the uniform state |U⟩ = H^⊗N|0⟩.
+        Grover diffusion D = H^⊗N · S₀ · H^⊗N (eq. 14).
+        |U⟩ = H^⊗N|0⟩ is the FIXED uniform state — never changes.
         """
-        # H^⊗N
         self._hadamard_layer()
-        # S₀: phase-flip |00…0⟩
         for i in range(self.T):
             qml.PauliX(wires=i)
         qml.ctrl(qml.PauliZ,
                  control=list(range(self.T - 1)))(wires=self.T - 1)
         for i in range(self.T):
             qml.PauliX(wires=i)
-        # H^⊗N
         self._hadamard_layer()
 
     # ══════════════════════════════════════════════════════════════════════
     # FULL CIRCUITS
     # ══════════════════════════════════════════════════════════════════════
 
-    def _build_base_circuit(self):
+    def _build_vqc_circuit(self):
         """
-        Base circuit (no Grover amplification):
-          VQC_ansatz → H^⊗N → measure probs
-
-        Used for:
-          • Inference when no marked states exist or |M| ≥ N_states/2.
-          • REINFORCE parameter-shift training (update()).
-
-        The Hadamard layer after the VQC maps the channel-conditioned
-        rotations into the same Hilbert-space superposition that the
-        Grover circuit uses, keeping training and inference consistent.
+        FIX 3: VQC circuit = policy network (trained via REINFORCE).
+        Circuit: AngleEmbed(CSI) + [RY+RZ+CNOT]×n_layers → probs.
+        Used in update() for gradient computation.
+        Also used in select() to get initial policy probs.
         """
         @qml.qnode(self.dev)
-        def base_circuit(inputs, weights):
-            # Layer 0: channel-conditioned state preparation (VQC)
+        def vqc_circuit(inputs, weights):
             self._vqc_ansatz(inputs, weights)
-            # Layer 1: Hadamard superposition (eq. 11–12)
-            self._hadamard_layer()
             return qml.probs(wires=range(self.T))
+        self.vqc_circuit = vqc_circuit
 
-        self.base_circuit = base_circuit
+    def _build_hadamard_only_circuit(self):
+        """
+        Pure Grover circuit WITHOUT VQC: H^⊗N → [Oracle→Diffusion]×G.
+        FIX 1: Hadamard FIRST — creates uniform superposition per eq. 11-12.
+        The VQC output is used to DETERMINE which states to mark (M),
+        but the Grover amplification itself starts fresh from |0⟩^⊗N.
+        """
+        pass  # built on demand via _get_grover_circuit()
 
     def _get_grover_circuit(self, marked_tuple: tuple):
         """
-        Build (and cache) a Grover QNode for a specific marked set.
+        FIX 1: Correct Grover circuit.
+        H^⊗N → [Oracle(M) → Diffusion] × G → probs.
 
-        Full circuit per Algorithm 1:
-          VQC_ansatz → H^⊗N → [Oracle → Diffusion] × G → measure probs
-
-        Caching avoids PennyLane re-tracing for the same marked set.
-        marked_tuple is a sorted, frozen tuple so it is hashable.
+        Note: this circuit takes NO VQC inputs/weights — it is a pure
+        Grover search circuit. The marked set M comes from the VQC policy
+        evaluation in select(), not from trainable parameters here.
         """
         if marked_tuple in self._grover_cache:
             return self._grover_cache[marked_tuple]
@@ -201,15 +158,13 @@ class QRLAgent:
         G_iters = self.G
 
         @qml.qnode(self.dev)
-        def grover_circuit(inputs, weights):
-            # Layer 0: channel-conditioned state preparation (VQC)
-            self._vqc_ansatz(inputs, weights)
-            # Layer 1: Hadamard — uniform superposition (eq. 12)
+        def grover_circuit():
+            # FIX 1: Start with uniform superposition (eq. 11-12)
             self._hadamard_layer()
-            # Layers 2+3: Oracle + Diffusion repeated G times (Algorithm 1)
+            # Grover iterations: Oracle + Diffusion (eq. 13-14)
             for _ in range(G_iters):
-                self._oracle(marked_tuple)   # eq. 13
-                self._diffusion()            # eq. 14
+                self._oracle(marked_tuple)
+                self._diffusion()
             return qml.probs(wires=range(self.T))
 
         self._grover_cache[marked_tuple] = grover_circuit
@@ -219,139 +174,156 @@ class QRLAgent:
     # UTILITY HELPERS
     # ══════════════════════════════════════════════════════════════════════
 
-    """
-    def _channel_to_angles(self, N: np.ndarray) -> np.ndarray:
-        
-        Convert channel matrix N (A×T) to T embedding angles ∈ [0, π].
-        Normalise mean absolute magnitude per user to [0,1] then scale by π.
-        
-        magnitudes = np.mean(np.abs(N), axis=0)              # (T,)
-        magnitudes = magnitudes / (magnitudes.max() + 1e-9)
-        return magnitudes * np.pi
-    """
-    
     def _channel_to_angles(self, N: np.ndarray) -> np.ndarray:
         """
-        Trích xuất đặc trưng kênh bằng cách tìm tương quan với ma trận DFT
-        giúp giữ lại thông tin về tính trực giao / không gian của các user.
+        DFT beam-domain feature extraction.
+        Projects channel onto beam space, picks strongest beam per user.
+        Normalised to [0, π] for AngleEmbedding.
         """
-        # Khởi tạo cục bộ ma trận DFT giống trong mMIMO_sys.py
         k = np.arange(self.A)
         n = np.arange(self.A)
         Omega = np.exp(-1j * 2 * np.pi * np.outer(k, n) / self.A) / np.sqrt(self.A)
-        
-        # Chiếu kênh truyền lên không gian chùm tia (beam domain)
-        dft_proj = np.abs(Omega.conj().T @ N)      # shape: (A, T)
-        
-        # Lấy sức mạnh của chùm tia tốt nhất cho mỗi user
-        best_beam_mag = np.max(dft_proj, axis=0)   # shape: (T,)
-        
-        # Chuẩn hóa về [0, pi]
-        return (best_beam_mag / (best_beam_mag.max() + 1e-9)) * np.pi
+        dft_proj     = np.abs(Omega.conj().T @ N)      # (A, T)
+        best_beam    = np.max(dft_proj, axis=0)        # (T,)
+        return (best_beam / (best_beam.max() + 1e-9)) * np.pi
 
     def _probs_to_marginals(self, probs_all: np.ndarray) -> np.ndarray:
-        """
-        Compute per-qubit marginal P(qubit t = 1) from full state probabilities.
-        marginals[t] = Σ_{s: bit t of s = 1} probs_all[s]
-        """
-        return self._bit_mask.T @ probs_all                  # (T,)
+        """Per-qubit marginal P(qubit t = 1) from full state distribution."""
+        return self._bit_mask.T @ probs_all             # (T,)
 
     def _log_prob_from_marginals(self, marginals: np.ndarray,
                                   theta: np.ndarray) -> float:
-        """
-        Log-probability of scheduling vector theta under Bernoulli marginals.
-        log P(θ) = Σ_t [ θ_t · log p_t + (1−θ_t) · log(1−p_t) ]
-        """
         p = np.where(theta == 1, marginals, 1.0 - marginals)
         return float(np.sum(np.log(np.clip(p, 1e-9, 1.0))))
 
-    def _identify_marked_states(self, probs_all: np.ndarray) -> tuple:
-        """
-        Oracle threshold logic — Algorithm 1, lines 6–9.
+    def _vqc_probs_to_theta(self, probs_all: np.ndarray,
+                             n_schedule: int) -> np.ndarray:
+        """Select top-n_schedule users by marginal probability."""
+        marginals = self._probs_to_marginals(probs_all)
+        theta = np.zeros(self.T, dtype=int)
+        theta[np.argsort(marginals)[-n_schedule:]] = 1
+        return theta
 
-        A state index s is marked (placed in M) if its probability
-        exceeds self.tau. This approximates "R ≥ τ": states that the
-        current policy already assigns high probability are treated as
-        high-reward candidates for amplification.
-
-        Returns a sorted tuple of marked indices (hashable for cache).
+    def _evaluate_reward_for_states(self, probs_all: np.ndarray,
+                                     n_schedule: int,
+                                     mimo_sys) -> tuple:
         """
-        marked = tuple(
-            int(s) for s in np.where(probs_all >= self.tau)[0]
-        )
-        return marked
+        FIX 2: Evaluate REWARD for candidate schedules to identify M.
+
+        For efficiency, we evaluate the top-k states by VQC probability
+        (k = min(8, N_states//4)) and mark those with reward > tau.
+
+        Returns (marked_tuple, best_theta, best_reward).
+        """
+        # Sort states by VQC probability — top candidates
+        k = min(8, max(2, self.N_states // 8))
+        top_indices = np.argsort(probs_all)[-k:][::-1]
+
+        marked = []
+        best_reward = -np.inf
+        best_theta  = None
+
+        for idx in top_indices:
+            # Decode state index to scheduling vector
+            bitstring = format(int(idx), f'0{self.T}b')
+            theta_cand = np.array([int(b) for b in bitstring], dtype=int)
+
+            # Only consider valid schedules (exactly n_schedule users)
+            if theta_cand.sum() != n_schedule:
+                continue
+
+            # FIX 2: evaluate actual reward from MIMO system
+            if mimo_sys is not None:
+                N  = mimo_sys.generate_channel()
+                F  = mimo_sys.beamforming_vector(K_avg=3)
+                sinr  = mimo_sys.compute_sinr(N, F, theta_cand)
+                rates = mimo_sys.instantaneous_rate(sinr)
+                r = mimo_sys.compute_pf_reward(rates, theta_cand)
+            else:
+                # Fallback: use log-probability as proxy (no MIMO system)
+                marginals = self._probs_to_marginals(probs_all)
+                r = self._log_prob_from_marginals(marginals, theta_cand)
+
+            if r > best_reward:
+                best_reward = r
+                best_theta  = theta_cand
+
+            if r >= self.tau:
+                marked.append(int(idx))
+
+        return tuple(sorted(marked)), best_theta, best_reward
 
     # ══════════════════════════════════════════════════════════════════════
     # PUBLIC API
     # ══════════════════════════════════════════════════════════════════════
 
-    def select(self, N: np.ndarray, n_schedule: int) -> np.ndarray:
+    def select(self, N: np.ndarray, n_schedule: int,
+               mimo_sys=None) -> np.ndarray:
         """
-        Select a scheduling vector θ ∈ {0,1}^T for channel state N.
+        Select a scheduling vector θ ∈ {0,1}^T.
 
-        Algorithm 1 (simplified per-step):
-          1. Encode channel N as VQC input angles.
-          2. Run base_circuit to get initial probability distribution.
-          3. Oracle threshold (lines 6–9): identify M = {s : p_s ≥ τ}.
-          4. If |M| ∈ (0, N_states/2): run Grover-amplified circuit.
-             Else: use base_circuit output directly.
-          5. Select top-n_schedule users by marginal probability.
+        Algorithm 1 (corrected):
+          1. VQC encodes CSI → policy probability distribution.
+          2. Evaluate reward for top candidate states → identify M (FIX 2).
+          3. If |M| valid: run Grover circuit H^⊗N→[O_M→Diff]×G (FIX 1).
+             Combine: argmax over Grover-amplified probs restricted to
+             states that also have high VQC probability.
+          4. Else: use VQC marginals directly (pure policy).
 
         Parameters
         ----------
-        N          : np.ndarray (A×T) — channel matrix for this time slot
-        n_schedule : int              — number of users to schedule
-
-        Returns
-        -------
-        theta : np.ndarray (T,) with exactly n_schedule ones
+        N         : (A×T) channel matrix
+        n_schedule: number of users to schedule
+        mimo_sys  : MassiveMIMOSystem instance (for reward evaluation)
+                    If None, falls back to probability-based selection.
         """
-        inputs = pnp.array(self._channel_to_angles(N), requires_grad=False)
+        inputs    = pnp.array(self._channel_to_angles(N), requires_grad=False)
+        vqc_probs = np.array(self.vqc_circuit(inputs, self.weights), dtype=float)
 
-        # Step 2: base probability distribution (VQC + H^⊗N)
-        base_probs = np.array(self.base_circuit(inputs, self.weights),
-                              dtype=float)
+        # FIX 2: identify marked states by reward evaluation
+        if mimo_sys is not None:
+            marked_tuple, best_theta, _ = self._evaluate_reward_for_states(
+                vqc_probs, n_schedule, mimo_sys)
+        else:
+            # Fallback without MIMO system: mark top-probability states
+            k = max(1, self.N_states // 4)
+            marked_tuple = tuple(sorted(
+                int(s) for s in np.argsort(vqc_probs)[-k:]
+            ))
+            best_theta = None
 
-        # Step 3: oracle threshold — identify high-reward states M (Algorithm 1, line 7)
-        marked_tuple = self._identify_marked_states(base_probs)
-
-        # Step 4: Grover amplification guard (|M| < N_states/2 required)
+        # FIX 1: Grover amplification from uniform superposition
         use_grover = (len(marked_tuple) > 0
                       and len(marked_tuple) < self.N_states // 2)
 
         if use_grover:
-            # Grover circuit: VQC → H^⊗N → [O_M → Diff]×G  (Algorithm 1, step 10)
-            circ      = self._get_grover_circuit(marked_tuple)
-            probs_all = np.array(circ(inputs, self.weights), dtype=float)
+            circ       = self._get_grover_circuit(marked_tuple)
+            grover_probs = np.array(circ(), dtype=float)
+            # Combine VQC policy with Grover amplification
+            combined   = vqc_probs * grover_probs
+            combined  /= combined.sum() + 1e-9
+            marginals  = self._probs_to_marginals(combined)
         else:
-            probs_all = base_probs
+            marginals = self._probs_to_marginals(vqc_probs)
 
-        # Step 5: pick top-n_schedule users by marginal P(qubit t = 1)
-        marginals = self._probs_to_marginals(probs_all)
-        theta     = np.zeros(self.T, dtype=int)
+        # Pick top-n_schedule users
+        theta = np.zeros(self.T, dtype=int)
         theta[np.argsort(marginals)[-n_schedule:]] = 1
+
+        # If we found a valid best_theta from reward eval, prefer it
+        if best_theta is not None and best_theta.sum() == n_schedule:
+            return best_theta
         return theta
 
     def update(self, N: np.ndarray, reward: float, theta: np.ndarray):
         """
-        REINFORCE policy-gradient update via parameter-shift rule.
+        FIX 3: REINFORCE policy-gradient update on the VQC circuit.
+        Parameter-shift rule on vqc_circuit (policy network).
 
-        Gradient (Algorithm 1, amplitude amplification step):
-          ∇_w log P(θ|w) = [ log P(θ|w+π/2·e_k) − log P(θ|w−π/2·e_k) ] / 2
-          ∇_w J ≈ reward × ∇_w log P(θ|w)
-
-        Gradients are computed on base_circuit (VQC + H^⊗N) so that
-        the underlying policy distribution is trained directly, making
-        the Grover amplification progressively less necessary as the
-        base policy improves (exploration → exploitation, Fig. 3).
+        The VQC is the trainable component; Grover amplification is
+        a fixed search procedure applied on top of the trained policy.
 
         Total QNode evaluations = 2 × n_layers × T × 2.
-
-        Parameters
-        ----------
-        N      : np.ndarray (A×T) — channel matrix used when theta was chosen
-        reward : float            — PF reward received (R in Algorithm 1)
-        theta  : np.ndarray (T,)  — scheduling vector that was executed
         """
         assert theta is not None, "theta must be provided for REINFORCE update."
 
@@ -363,36 +335,25 @@ class QRLAgent:
         for l in range(self.n_layers):
             for i in range(self.T):
                 for k in range(2):
-                    # Forward shift: w_k ← w_k + π/2
                     w_raw[l, i, k] += shift
-                    p_plus   = np.array(self.base_circuit(inputs, w_raw),
-                                        dtype=float)
+                    p_plus   = np.array(self.vqc_circuit(inputs, w_raw), dtype=float)
                     lp_plus  = self._log_prob_from_marginals(
                                    self._probs_to_marginals(p_plus), theta)
 
-                    # Backward shift: w_k ← w_k − π/2
                     w_raw[l, i, k] -= 2 * shift
-                    p_minus  = np.array(self.base_circuit(inputs, w_raw),
-                                        dtype=float)
+                    p_minus  = np.array(self.vqc_circuit(inputs, w_raw), dtype=float)
                     lp_minus = self._log_prob_from_marginals(
                                    self._probs_to_marginals(p_minus), theta)
 
-                    # Restore weight
                     w_raw[l, i, k] += shift
-
-                    # REINFORCE × parameter-shift gradient
-                    grad[l, i, k] = reward * (lp_plus - lp_minus) / 2.0
+                    grad[l, i, k]   = reward * (lp_plus - lp_minus) / 2.0
 
         # Adam update
         self._adam_t += 1
-        self._adam_m  = (self._adam_b1 * self._adam_m
-                         + (1 - self._adam_b1) * grad)
-        self._adam_v  = (self._adam_b2 * self._adam_v
-                         + (1 - self._adam_b2) * grad ** 2)
+        self._adam_m  = self._adam_b1 * self._adam_m + (1 - self._adam_b1) * grad
+        self._adam_v  = self._adam_b2 * self._adam_v + (1 - self._adam_b2) * grad ** 2
         m_hat = self._adam_m / (1 - self._adam_b1 ** self._adam_t)
         v_hat = self._adam_v / (1 - self._adam_b2 ** self._adam_t)
         new_w = w_raw + self.lr * m_hat / (np.sqrt(v_hat) + self._adam_eps)
 
         self.weights = pnp.array(new_w, requires_grad=True)
-        
-    
