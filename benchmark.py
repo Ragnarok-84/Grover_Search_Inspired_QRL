@@ -52,12 +52,12 @@ def _stochastic_select(scores: np.ndarray, n_schedule: int) -> np.ndarray:
     to normalised scores (softmax-like marginals).
     This mirrors the quantum measurement step in QRLAgent.select().
     """
-    probs    = np.clip(scores, 1e-9, None)
-    probs   /= probs.sum()
-    selected = np.random.choice(len(scores), size=n_schedule,
-                                replace=False, p=probs)
-    theta    = np.zeros(len(scores), dtype=int)
-    theta[selected] = 1
+    probs = np.clip(scores, 1e-9, 1.0 - 1e-9)
+    theta = np.random.binomial(1, probs)
+    
+    # Fallback nếu tắt hết user
+    if theta.sum() == 0:
+        theta[np.argmax(probs)] = 1
     return theta
 
 

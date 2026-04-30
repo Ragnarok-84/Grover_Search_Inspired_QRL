@@ -195,18 +195,6 @@ class QRLAgent:
                                  mimo_sys,
                                  N: np.ndarray,
                                  F: np.ndarray) -> tuple:
-        """
-        Oracle evaluation (Algorithm 1, lines 6-9).
-
-        Evaluates the top-k candidate schedules ranked by VQC probability on
-        the CURRENT channel (N, F).  States with sum rate >= tau are marked.
-
-        Returns
-        -------
-        marked_tuple : sorted tuple of high-reward state indices
-        best_theta   : theta achieving highest reward among candidates
-        best_reward  : that best reward value
-        """
         k           = min(16, max(4, self.N_states // 4))
         top_indices = np.argsort(vqc_probs)[-k:][::-1]
 
@@ -214,25 +202,32 @@ class QRLAgent:
         best_reward = -np.inf
         best_theta  = None
 
+        # Vòng 1: Tìm ra reward cao nhất trong các ứng viên
         for idx in top_indices:
             bits       = format(int(idx), f'0{self.T}b')
             theta_cand = np.array([int(b) for b in bits], dtype=int)
-
-            if theta_cand.sum() == 0:
-                continue
-
+            if theta_cand.sum() == 0: continue
+            
             sinr  = mimo_sys.compute_sinr(N, F, theta_cand)
-            rates = mimo_sys.instantaneous_rate(sinr)
-            r     = float(np.sum(rates))
-
+            r     = float(np.sum(mimo_sys.instantaneous_rate(sinr)))
             if r > best_reward:
                 best_reward = r
                 best_theta  = theta_cand
 
-            if r >= self.tau:
+        # Vòng 2: Đánh dấu (Mark) nếu vượt tau HOẶC là ứng viên giỏi nhất
+        for idx in top_indices:
+            bits       = format(int(idx), f'0{self.T}b')
+            theta_cand = np.array([int(b) for b in bits], dtype=int)
+            if theta_cand.sum() == 0: continue
+            
+            sinr  = mimo_sys.compute_sinr(N, F, theta_cand)
+            r     = float(np.sum(mimo_sys.instantaneous_rate(sinr)))
+            
+            # ELITIST MARKING: Luôn đảm bảo Grover hoạt động
+            if r >= self.tau or r == best_reward:
                 marked.append(int(idx))
 
-        return tuple(sorted(marked)), best_theta, best_reward
+        return tuple(sorted(set(marked))), best_theta, best_reward
 
     # ──────────────────────────────────────────────────────────────────────
     # Public API
