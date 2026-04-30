@@ -176,10 +176,31 @@ class QNNScheduler:
 
         self._vqc = _vqc
 
+    '''
     def _channel_to_angles(self, N: np.ndarray) -> np.ndarray:
         magnitudes = np.mean(np.abs(N), axis=0)
         magnitudes = magnitudes / (magnitudes.max() + 1e-9)
         return magnitudes * np.pi
+    '''
+        
+    def _channel_to_angles(self, N: np.ndarray) -> np.ndarray:
+        """
+        Trích xuất đặc trưng kênh bằng cách tìm tương quan với ma trận DFT
+        giúp giữ lại thông tin về tính trực giao / không gian của các user.
+        """
+        # Khởi tạo cục bộ ma trận DFT giống trong mMIMO_sys.py
+        k = np.arange(self.A)
+        n = np.arange(self.A)
+        Omega = np.exp(-1j * 2 * np.pi * np.outer(k, n) / self.A) / np.sqrt(self.A)
+        
+        # Chiếu kênh truyền lên không gian chùm tia (beam domain)
+        dft_proj = np.abs(Omega.conj().T @ N)      # shape: (A, T)
+        
+        # Lấy sức mạnh của chùm tia tốt nhất cho mỗi user
+        best_beam_mag = np.max(dft_proj, axis=0)   # shape: (T,)
+        
+        # Chuẩn hóa về [0, pi]
+        return (best_beam_mag / (best_beam_mag.max() + 1e-9)) * np.pi
 
     def _probs_to_marginals(self, probs_all: np.ndarray) -> np.ndarray:
         return self._bit_mask.T @ probs_all

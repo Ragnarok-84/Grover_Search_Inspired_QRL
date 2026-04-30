@@ -66,15 +66,19 @@ def run(n_epochs=N_EPOCHS):
     history = []
     t0 = time.time()
 
+    sys.reset_channel_conditions()
     for epoch in range(1, n_epochs + 1):
-        sys.reset_channel_conditions()
+        
         F     = sys.beamforming_vector()
         N     = sys.generate_channel()
 
         theta  = agent.select(N, N_SCHED)
         sinr   = sys.compute_sinr(N, F, theta)
         rates  = sys.instantaneous_rate(sinr)
-        reward = sys.compute_pf_reward(rates, theta)
+        
+        # reward = sys.compute_pf_reward(rates, theta)
+        reward = float(np.sum(rates))
+        
         sys.update_avg_rate(rates, theta)
         agent.update(N, reward, theta)
 
