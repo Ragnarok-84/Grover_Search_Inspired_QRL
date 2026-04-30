@@ -75,9 +75,10 @@ def run(n_epochs=N_EPOCHS, ant_range=ANT_RANGE):
         sys = MassiveMIMOSystem(A=A, T=T, snr_db=SNR_DB)
 
         print(f"\n  A={A}  ~{n_epochs * 2 * 2 * N_LAYERS * T * 2:,} QNode calls")
+        sys.reset_channel_conditions()
 
         for epoch in range(1, n_epochs + 1):
-            sys.reset_channel_conditions()
+            
             F = sys.beamforming_vector()
             N = sys.generate_channel()
 
