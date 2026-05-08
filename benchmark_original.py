@@ -48,20 +48,16 @@ def _channel_to_angles(N: np.ndarray, Omega: np.ndarray) -> np.ndarray:
 
 def _stochastic_select(scores: np.ndarray, n_schedule: int) -> np.ndarray:
     """
-    Select exactly n_schedule users by sampling without replacement.
-    This keeps the baselines comparable with QRLAgent.select().
+    Select n_schedule users by sampling WITHOUT replacement, proportional
+    to normalised scores (softmax-like marginals).
+    This mirrors the quantum measurement step in QRLAgent.select().
     """
-    scores = np.asarray(scores, dtype=float).reshape(-1)
-    T = scores.size
-    n_schedule = int(np.clip(n_schedule, 1, T))
-    probs = np.clip(scores, 1e-12, None)
-    if not np.isfinite(probs).all() or probs.sum() <= 0:
-        probs = np.ones(T, dtype=float) / T
-    else:
-        probs = probs / probs.sum()
-    chosen = np.random.choice(T, size=n_schedule, replace=False, p=probs)
-    theta = np.zeros(T, dtype=int)
-    theta[chosen] = 1
+    probs = np.clip(scores, 1e-9, 1.0 - 1e-9)
+    theta = np.random.binomial(1, probs)
+    
+    # Fallback nếu tắt hết user
+    if theta.sum() == 0:
+        theta[np.argmax(probs)] = 1
     return theta
 
 

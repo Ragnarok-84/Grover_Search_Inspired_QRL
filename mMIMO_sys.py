@@ -3,31 +3,32 @@ from scipy.linalg import toeplitz
 
 
 class MassiveMIMOSystem:
+    """
+    Single-cell massive-MIMO downlink environment with correlated Rician fading,
+    DFT/statistical beamforming, Shannon rate, sum-rate, and PF reward.
+    """
 
     def __init__(self, A: int = 32, T: int = 6,
                  K_factor: float = 3.0, snr_db: float = 20.0,
-                 omega: float = 0.1):
-        """
-        Parameters
-        ----------
-        A        : total BS antennas  (must be factorable as X*Y)
-        T        : number of candidate users
-        K_factor : Rician K-factor (LoS-to-NLoS power ratio)
-        snr_db   : downlink SNR in dB
-        omega    : PF forgetting factor
-        """
-        self.A      = A
-        self.T      = T
-        self.K      = K_factor
-        self.snr    = 10 ** (snr_db / 10.0)
+                 omega: float = 0.1, total_power: float = 1.0,
+                 pf_epsilon: float = 1e-9, rho: float = 0.7,
+                 seed: int | None = None):
+        self.A = A
+        self.T = T
+        self.K = K_factor
+        self.snr_db = snr_db
+        self.snr = 10 ** (snr_db / 10.0)
         self.sigma2 = 1.0 / self.snr
-        self.omega  = omega
+        self.omega = omega
+        self.total_power = total_power
+        self.pf_epsilon = pf_epsilon
+        self.rho = rho
+        self.rng = np.random.default_rng(seed)
 
-        # ── UPA dimensions: X rows × Y cols, X*Y = A ──────────────────────
         self.X = int(np.floor(np.sqrt(A)))
         while A % self.X != 0:
             self.X -= 1
-        self.Y = A // self.X   # e.g. A=32 → X=4, Y=8
+        self.Y = A // self.X
 
         self._build_dft_matrix()
         self.reset_channel_conditions()
@@ -35,156 +36,126 @@ class MassiveMIMOSystem:
     # ──────────────────────────────────────────────────────────────────────
     # DFT / geometry
     # ──────────────────────────────────────────────────────────────────────
-
     def _build_dft_matrix(self):
-        """
-        UPA DFT matrix = kron(Omega_X, Omega_Y)  shape: (A, A)
-        Each axis uses an unitary DFT normalised by 1/sqrt(dim).
-        """
-        nx = np.arange(self.X)
-        kx = np.arange(self.X)
-        Omega_X = (np.exp(-1j * 2 * np.pi * np.outer(kx, nx) / self.X)
-                   / np.sqrt(self.X))
-
-        ny = np.arange(self.Y)
-        ky = np.arange(self.Y)
-        Omega_Y = (np.exp(-1j * 2 * np.pi * np.outer(ky, ny) / self.Y)
-                   / np.sqrt(self.Y))
-
-        self.Omega = np.kron(Omega_X, Omega_Y)   # (A, A)
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Channel geometry initialisation
-    # ──────────────────────────────────────────────────────────────────────
+        nx = np.arange(self.X); kx = np.arange(self.X)
+        Omega_X = np.exp(-1j * 2 * np.pi * np.outer(kx, nx) / self.X) / np.sqrt(self.X)
+        ny = np.arange(self.Y); ky = np.arange(self.Y)
+        Omega_Y = np.exp(-1j * 2 * np.pi * np.outer(ky, ny) / self.Y) / np.sqrt(self.Y)
+        self.Omega = np.kron(Omega_X, Omega_Y)
 
     def reset_channel_conditions(self):
-        """
-        Randomise the large-scale geometry (angles, correlation) for all T
-        users.  Call ONCE before the training loop; geometry is then fixed.
-        """
-        azimuth   = np.random.uniform(0.0, 2 * np.pi, self.T)
-        elevation = np.random.uniform(0.0,     np.pi, self.T)
+        """Fix large-scale user geometry. Call once before a training run."""
+        azimuth = self.rng.uniform(0.0, 2 * np.pi, self.T)
+        elevation = self.rng.uniform(0.0, np.pi, self.T)
 
-        # ── LoS steering vectors  (UPA Kronecker structure) ───────────────
-        # Each vector has power = A (no 1/sqrt(A) normalisation),
-        # which keeps channel power O(A) and sum rate in the 20–32 bps/Hz
-        # range expected by the paper at SNR=20 dB.
         self.n_LoS = np.zeros((self.A, self.T), dtype=complex)
         for t in range(self.T):
             sin_el = np.sin(elevation[t])
-            cos_az = np.cos(azimuth[t])
-            sin_az = np.sin(azimuth[t])
-            ax = np.exp(1j * np.pi * np.arange(self.X) * sin_el * cos_az)
-            ay = np.exp(1j * np.pi * np.arange(self.Y) * sin_el * sin_az)
-            self.n_LoS[:, t] = np.kron(ax, ay)   # length A, power = A
+            ax = np.exp(1j * np.pi * np.arange(self.X) * sin_el * np.cos(azimuth[t]))
+            ay = np.exp(1j * np.pi * np.arange(self.Y) * sin_el * np.sin(azimuth[t]))
+            # Unnormalised steering vector. Power is O(A), matching the scale
+            # used in the previous implementation and the paper-like plots.
+            self.n_LoS[:, t] = np.kron(ax, ay)
 
-        # ── Spatial correlation  M ∈ C^{A×A}  (paper eq. 5, typo fixed) ──
-        # M = kron(R_X, R_Y)  with exponential Toeplitz, rho = 0.7
-        rho = 0.7
-        R_X = toeplitz(rho ** np.arange(self.X))   # (X, X)
-        R_Y = toeplitz(rho ** np.arange(self.Y))   # (Y, Y)
-        M   = np.kron(R_X, R_Y)                   # (A, A)
+        R_X = toeplitz(self.rho ** np.arange(self.X))
+        R_Y = toeplitz(self.rho ** np.arange(self.Y))
+        M = np.kron(R_X, R_Y)
+        self.L = np.linalg.cholesky(M + 1e-9 * np.eye(self.A))
 
-        # Cholesky factor for spatially correlated NLoS generation
-        self.L = np.linalg.cholesky(M + 1e-9 * np.eye(self.A))  # (A, A)
+        self._K_tilde = np.sqrt(self.K / (self.K + 1.0))
+        self._K_hat = np.sqrt(1.0 / (self.K + 1.0))
+        self.reset_pf_state()
 
-        # Rician mixture coefficients
-        self._K_tilde = np.sqrt(self.K / (self.K + 1.0))   # LoS weight
-        self._K_hat   = np.sqrt(1.0   / (self.K + 1.0))    # NLoS weight
-
-        # PF historical rate tracker
-        self.avg_rate = np.ones(self.T) * 1e-3
+    def reset_pf_state(self):
+        self.avg_rate = np.ones(self.T, dtype=float) * 1e-3
 
     # ──────────────────────────────────────────────────────────────────────
-    # Channel generation
+    # Channel generation / beamforming
     # ──────────────────────────────────────────────────────────────────────
-
     def generate_channel(self) -> np.ndarray:
-        """
-        Sample one realisation of the correlated Rician channel (eq. 4-5).
-
-        H = K_tilde * n_LoS  +  K_hat * L @ H_iid
-
-        Returns N : (A, T) complex array
-        """
-        H_iid = (np.random.randn(self.A, self.T)
-                 + 1j * np.random.randn(self.A, self.T)) / np.sqrt(2.0)
-        n_NLoS = self.L @ H_iid                               # (A, T)
+        H_iid = (self.rng.standard_normal((self.A, self.T))
+                 + 1j * self.rng.standard_normal((self.A, self.T))) / np.sqrt(2.0)
+        n_NLoS = self.L @ H_iid
         return self._K_tilde * self.n_LoS + self._K_hat * n_NLoS
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Beamforming
-    # ──────────────────────────────────────────────────────────────────────
-
-    def beamforming_vector(self) -> np.ndarray:
+    def beamforming_vector(self, N_stat: np.ndarray | None = None) -> np.ndarray:
         """
-        Statistical DFT beamforming (eq. 7): for each user t find the DFT
-        column j* that maximises |Omega^H n_LoS_t|^2, then use Omega[:, j*]
-        as the beamforming vector.
-
-        Returns F : (A, T) complex array  (one beam column per user)
+        DFT beamforming: choose the strongest beam for each user.
+        If N_stat is provided, use that channel; otherwise use fixed LoS geometry.
         """
-        # Project LoS steering vectors onto DFT beam space
-        beam_power = np.abs(self.Omega.conj().T @ self.n_LoS) ** 2  # (A, T)
-        j_star     = np.argmax(beam_power, axis=0)                   # (T,)
-        return self.Omega[:, j_star]                                 # (A, T)
+        channel_for_beams = self.n_LoS if N_stat is None else N_stat
+        beam_power = np.abs(self.Omega.conj().T @ channel_for_beams) ** 2
+        j_star = np.argmax(beam_power, axis=0)
+        return self.Omega[:, j_star]
 
     # ──────────────────────────────────────────────────────────────────────
     # SINR / rate / reward
     # ──────────────────────────────────────────────────────────────────────
+    def _validate_theta(self, theta: np.ndarray) -> np.ndarray:
+        theta = np.asarray(theta, dtype=int).reshape(-1)
+        if theta.size != self.T:
+            raise ValueError(f"theta length must be T={self.T}, got {theta.size}")
+        if not np.all((theta == 0) | (theta == 1)):
+            raise ValueError("theta must be binary")
+        return theta
 
-    def compute_sinr(self, N: np.ndarray, F: np.ndarray,
-                     theta: np.ndarray) -> np.ndarray:
-        sinr  = np.zeros(self.T)
-        
-        P = 1.0 / self.T 
+    def compute_sinr(self, N: np.ndarray, F: np.ndarray, theta: np.ndarray) -> np.ndarray:
+        theta = self._validate_theta(theta)
+        sinr = np.zeros(self.T, dtype=float)
+        active = np.where(theta == 1)[0]
+        if active.size == 0:
+            return sinr
 
-        for t in range(self.T):
-            if theta[t] == 0:
-                continue
-            signal = np.abs(F[:, t].conj() @ N[:, t]) ** 2 * P
-            interf = sum(
-                np.abs(F[:, x].conj() @ N[:, t]) ** 2 * P
-                for x in range(self.T) if x != t and theta[x] == 1
-            )
+        # Paper assumes equal power per user. For fixed-size scheduling this is
+        # equivalent to total_power / active.size; for paper Eq. notation it is
+        # also close to total_power / T when active.size is fixed.
+        P_user = self.total_power / active.size
+
+        for t in active:
+            signal = np.abs(F[:, t].conj() @ N[:, t]) ** 2 * P_user
+            interf = 0.0
+            for x in active:
+                if x != t:
+                    interf += np.abs(F[:, x].conj() @ N[:, t]) ** 2 * P_user
             sinr[t] = signal / (interf + self.sigma2)
-
         return sinr
 
     def instantaneous_rate(self, sinr: np.ndarray) -> np.ndarray:
-        """Per-user Shannon rate  R_t = log2(1 + SINR_t)  (eq. 3)."""
-        return np.log2(1.0 + sinr)
+        return np.log2(1.0 + np.asarray(sinr, dtype=float))
 
-    def compute_pf_reward(self, rates: np.ndarray,
-                          theta: np.ndarray) -> float:
-        """Proportional Fairness reward (eq. 10)."""
-        a      = 1e-9
+    def compute_sum_rate(self, rates: np.ndarray, theta: np.ndarray | None = None) -> float:
+        rates = np.asarray(rates, dtype=float)
+        if theta is None:
+            return float(np.sum(rates))
+        theta = self._validate_theta(theta)
+        return float(np.sum(rates * theta))
+
+    def compute_pf_reward(self, rates: np.ndarray, theta: np.ndarray) -> float:
+        theta = self._validate_theta(theta)
+        rates = np.asarray(rates, dtype=float)
         reward = 0.0
         for t in range(self.T):
             if theta[t] == 1:
-                s_bar_next = ((1 - self.omega) * self.avg_rate[t]
-                              + self.omega * rates[t])
-                reward += rates[t] / (s_bar_next + a)
-        return reward
+                s_bar_next = (1 - self.omega) * self.avg_rate[t] + self.omega * rates[t]
+                reward += rates[t] / (s_bar_next + self.pf_epsilon)
+        return float(reward)
 
     def update_avg_rate(self, rates: np.ndarray, theta: np.ndarray):
-        """EMA update of historical average rates (eq. 10, second line)."""
+        theta = self._validate_theta(theta)
+        rates = np.asarray(rates, dtype=float)
         for t in range(self.T):
             if theta[t] == 1:
-                self.avg_rate[t] = ((1 - self.omega) * self.avg_rate[t]
-                                    + self.omega * rates[t])
+                self.avg_rate[t] = (1 - self.omega) * self.avg_rate[t] + self.omega * rates[t]
 
-    def step(self, theta: np.ndarray, F: np.ndarray = None):
-        """
-        Convenience wrapper: sample channel, compute SINR/rates.
-        Returns (N, F, sinr, rates).
-        """
+    def evaluate_theta(self, N: np.ndarray, F: np.ndarray, theta: np.ndarray):
+        sinr = self.compute_sinr(N, F, theta)
+        rates = self.instantaneous_rate(sinr)
+        return sinr, rates, self.compute_sum_rate(rates, theta), self.compute_pf_reward(rates, theta)
+
+    def step(self, theta: np.ndarray, F: np.ndarray | None = None):
         N = self.generate_channel()
         if F is None:
             F = self.beamforming_vector()
-        sinr  = self.compute_sinr(N, F, theta)
+        sinr = self.compute_sinr(N, F, theta)
         rates = self.instantaneous_rate(sinr)
         return N, F, sinr, rates
-    
-    def compute_sum_rate(self, rates, theta):
-        return np.sum(rates * theta)

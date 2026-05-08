@@ -41,7 +41,7 @@ TARGET_WIRES = [W_ACTION, W_REWARD]   # 2 wires for the MDP step operator
 T_QUBITS = 7                           # drastically reduced from paper's 11
 ESTIMATION_WIRES = list(range(2, 2 + T_QUBITS))   # wires 2-8
 
-# Policy space  P_N  with N = 8 policies
+# Policy space  P_N  with N = 1024 policies
 N_POLICIES = 1024                         # must be a power of 2 for clean encoding
 N_POLICY_QUBITS = int(math.log2(N_POLICIES))       # = 3
 
